@@ -1,0 +1,19 @@
+# Extra environment notes for the speech inpainting training branch.
+# Start from the official VoiceCraft-X environment, then pin the versions below.
+
+torch==2.1.0
+torchaudio==2.1.0
+torchvision==0.16.0
+transformers==4.51.3
+lightning==2.4.0
+WeTextProcessing==1.0.4.1
+funasr==1.2.6
+jiwer==3.1.0
+joblib==1.3.2
+fire==0.7.0
+setuptools==69.5.1
+
+# Installed in the local experiment environment:
+# flash-attn==2.5.6
+# The tested wheel was:
+# https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.6/flash_attn-2.5.6+cu122torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl

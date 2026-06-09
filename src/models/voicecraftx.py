@@ -191,6 +191,120 @@ class VoiceCraftX(nn.Module):
             shifted_seqs.append(shifted_ids)
 
         return shifted_seqs # , patterns
+
+    def shift_batch(self, seqs, fill_value=None):
+        if seqs.dim() != 3:
+            raise ValueError("seqs must have shape [batch, num_codebooks, seq_len]")
+        if seqs.shape[1] != self.num_codebooks:
+            raise ValueError(f"expected {self.num_codebooks} codebooks, got {seqs.shape[1]}")
+
+        fill_value = self.config.speech_empty_idx if fill_value is None else fill_value
+        batch_size, _, seq_len = seqs.shape
+        shift_per_row = torch.arange(1, self.num_codebooks + 1, device=seqs.device).unsqueeze(1)
+        shifted_length = seq_len + int(shift_per_row.max().item())
+        shifted = torch.full(
+            (batch_size, self.num_codebooks, shifted_length),
+            fill_value,
+            dtype=seqs.dtype,
+            device=seqs.device,
+        )
+        positions = shift_per_row + torch.arange(seq_len, device=seqs.device).unsqueeze(0)
+        rows = torch.arange(self.num_codebooks, device=seqs.device).unsqueeze(1).expand(-1, seq_len)
+        shifted[:, rows, positions] = seqs
+        return shifted
+
+    def embed_speech(self, speech_tokens):
+        if speech_tokens.dim() != 3:
+            raise ValueError("speech_tokens must have shape [batch, num_codebooks, seq_len]")
+        embeddings = [
+            self.speech_embedding[k](speech_tokens[:, k])
+            for k in range(self.num_codebooks)
+        ]
+        return torch.stack(embeddings, dim=0).sum(dim=0)
+
+    def forward(
+        self,
+        text,
+        prompt_speech_token,
+        speaker_emb,
+        labels=None,
+        text_attention_mask=None,
+        ignore_index=-100,
+        return_logits=True,
+    ):
+        if text.dim() == 1:
+            text = text.unsqueeze(0)
+        if prompt_speech_token.dim() != 3:
+            raise ValueError("prompt_speech_token must have shape [batch, num_codebooks, seq_len]")
+        if speaker_emb.dim() == 1:
+            speaker_emb = speaker_emb.unsqueeze(0)
+
+        text = text.to(self.device)
+        prompt_speech_token = prompt_speech_token.to(self.device)
+        speaker_emb = speaker_emb.to(self.device)
+        if labels is not None:
+            labels = labels.to(self.device)
+        if text_attention_mask is not None:
+            text_attention_mask = text_attention_mask.to(self.device)
+
+        text_emb = self.llm.model.embed_tokens(text)
+        shifted_speech = self.shift_batch(prompt_speech_token)
+        speech_inputs = shifted_speech[:, :, :-1]
+        speech_targets = shifted_speech[:, :, 1:]
+        if labels is not None:
+            shifted_labels = self.shift_batch(labels.long(), fill_value=ignore_index)[:, :, 1:]
+            speech_targets = torch.where(
+                shifted_labels.eq(ignore_index),
+                torch.full_like(speech_targets, ignore_index),
+                speech_targets,
+            )
+        else:
+            shifted_labels = speech_targets
+
+        speech_emb = self.embed_speech(speech_inputs)
+        speaker_emb = self.spk_embed_affine_layer(F.normalize(speaker_emb, dim=-1)).unsqueeze(1)
+        hidden_states = torch.cat([text_emb, speaker_emb, speech_emb], dim=1)
+
+        batch_size = hidden_states.shape[0]
+        if text_attention_mask is None:
+            text_attention_mask = text.ne(self.llm_padding_idx)
+        speaker_attention_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=self.device)
+        speech_attention_mask = torch.ones(
+            (batch_size, speech_emb.shape[1]), dtype=torch.bool, device=self.device
+        )
+        attention_mask = torch.cat(
+            [text_attention_mask.bool(), speaker_attention_mask, speech_attention_mask],
+            dim=1,
+        )
+
+        outputs = self.llm.model(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+        speech_hidden = outputs.last_hidden_state[:, -speech_emb.shape[1]:]
+        logits = torch.stack(
+            [self.llm_decoder[k](speech_hidden) for k in range(self.num_codebooks)],
+            dim=1,
+        )
+
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                speech_targets.reshape(-1),
+                ignore_index=ignore_index,
+            )
+
+        speech_loss_mask = speech_targets.ne(ignore_index).any(dim=1)
+        return {
+            "loss": loss,
+            "logits": logits if return_logits else None,
+            "shifted_labels": speech_targets,
+            "speech_loss_mask": speech_loss_mask,
+        }
     
     @torch.inference_mode()
     def generate(
