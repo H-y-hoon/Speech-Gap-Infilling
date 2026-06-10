@@ -13,7 +13,9 @@ This branch contains experimental training code for speech inpainting / gap infi
 - Input construction: `prefix + speech_mask + suffix + speech_mask + middle`.
 - Masking: online random masking during training; deterministic masking is available for debugging/eval.
 - Current objective: masked speech token prediction.
-- Current eval: `eval_loss`; PESQ/STOI, ASR WER, and speaker similarity are planned final metrics.
+- Current eval/debug metrics: `eval_loss`, `eval_masked_token_accuracy`, `eval_codebook_*_accuracy`, `loss_moving_avg`.
+- Current generation diagnosis: fixed validation samples can be exported as `original.wav`, `masked_input.wav`, and `generated_matched.wav`.
+- PESQ/STOI, ASR WER, and speaker similarity are planned final metrics.
 
 ## Files Added for Inpainting
 
@@ -23,6 +25,7 @@ This branch contains experimental training code for speech inpainting / gap infi
 - `scripts/create_tokenized_wds.py`
 - `scripts/inspect_tokenized_wds.py`
 - `scripts/train_inpainting.py`
+- `scripts/generate_inpainting_samples.py`
 - `tests/test_online_masking.py`
 - `tests/test_tokenized_wds.py`
 - `tests/test_voicecraftx_training.py`
@@ -120,6 +123,66 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/train_inpainting.py \
   --mask-len-max 30 \
   --lr 5e-6
 ```
+
+Recommended current recipe for checkpoint generation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/train_inpainting.py \
+  --wds-root data/tokenized_wds/train-clean-100 \
+  --output-dir exp/inpainting_online_1000_mask10_30_lr1e5 \
+  --limit 1000 \
+  --eval-split-size 100 \
+  --batch-size 1 \
+  --max-steps 5000 \
+  --save-every 5000 \
+  --log-every 100 \
+  --eval-every 500 \
+  --eval-mask-len 20 \
+  --mask-len-min 10 \
+  --mask-len-max 30 \
+  --lr 1e-5
+```
+
+For metric-only runs without checkpoint files, add:
+
+```bash
+--no-save
+```
+
+`--save-every 0` disables intermediate checkpoints but still writes `last.pt`. `--no-save` disables both intermediate checkpoints and `last.pt`.
+
+## Generation Diagnosis
+
+Export fixed validation samples for listening checks:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/generate_inpainting_samples.py \
+  --wds-root data/tokenized_wds/train-clean-100 \
+  --checkpoint exp/inpainting_online_1000_mask10_30_lr1e5/step-005000.pt \
+  --output-dir exp/inpainting_generation_check \
+  --limit 1000 \
+  --eval-split-size 100 \
+  --num-samples 4 \
+  --eval-mask-len 20 \
+  --max-new-frames 60
+```
+
+Each sample directory contains:
+
+```text
+original.wav              original validation audio
+masked_input.wav          original audio with the target gap zeroed
+generated.wav             raw generated span inserted into context
+generated_matched.wav     generated span trimmed/padded to the target gap length
+generated_gap*.wav        generated gap-only files when decodable
+metadata.json             text, mask interval, generated frame counts
+```
+
+Use `generated_matched.wav` first for direct comparison with `original.wav` and `masked_input.wav`. Raw `generated.wav` may have a different duration because current VoiceCraft-X generation does not force the target gap length.
+
+## Experiment Log
+
+See `EXPERIMENTS_INPAINTING.md` for the accumulated experiment history, settings, results, and current interpretation.
 
 ## Notes
 

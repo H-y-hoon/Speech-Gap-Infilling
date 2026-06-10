@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--no-save", action="store_true", help="Disable all checkpoint writes, including last.pt.")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--eval-every", type=int, default=0)
     parser.add_argument("--eval-split-size", type=int, default=0)
@@ -128,6 +129,8 @@ def main() -> None:
     step = 0
     examples_seen = 0
     loss_sum = 0.0
+    loss_window_sum = 0.0
+    loss_window_count = 0
     train_start = time.perf_counter()
     dataset_size = len(train_dataset)
     optimizer.zero_grad(set_to_none=True)
@@ -174,17 +177,23 @@ def main() -> None:
             examples_seen += batch_size
             loss_value = float(loss.detach().cpu().item() * args.gradient_accumulation_steps)
             loss_sum += loss_value
+            loss_window_sum += loss_value
+            loss_window_count += 1
             if step % args.log_every == 0:
                 target_tokens = int(batch["loss_mask"].sum().item())
                 metrics = {
                     "loss": _format_metric(loss_value),
+                    "loss_moving_avg": _format_metric(loss_window_sum / max(loss_window_count, 1)),
                     "grad_norm": _format_metric(_to_float(grad_norm)),
-                    "learning_rate": _format_metric(optimizer.param_groups[0]["lr"]),
+                    "lr": _format_metric(optimizer.param_groups[0]["lr"]),
                     "epoch": _format_metric(examples_seen / max(dataset_size, 1)),
                     "target_frames": str(target_tokens),
                     "step": str(step),
                 }
+                metrics.update(_progress_metrics(train_start, step, args.max_steps))
                 print(metrics, flush=True)
+                loss_window_sum = 0.0
+                loss_window_count = 0
 
             if eval_dataloader is not None and args.eval_every > 0 and step % args.eval_every == 0:
                 eval_metrics = evaluate(
@@ -197,15 +206,17 @@ def main() -> None:
                 )
                 eval_metrics["epoch"] = _format_metric(examples_seen / max(dataset_size, 1))
                 eval_metrics["step"] = str(step)
+                eval_metrics.update(_progress_metrics(train_start, step, args.max_steps))
                 print(eval_metrics, flush=True)
 
-            if args.save_every > 0 and step % args.save_every == 0:
+            if not args.no_save and args.save_every > 0 and step % args.save_every == 0:
                 save_checkpoint(output_dir / f"step-{step:06d}.pt", model, optimizer, step, args)
 
             if step >= args.max_steps:
                 break
 
-    save_checkpoint(output_dir / "last.pt", model, optimizer, step, args)
+    if not args.no_save:
+        save_checkpoint(output_dir / "last.pt", model, optimizer, step, args)
     train_runtime = time.perf_counter() - train_start
     train_metrics = {
         "train_runtime": _format_metric(train_runtime),
@@ -226,6 +237,10 @@ def evaluate(model, dataloader, text_tokenizer, config, args, device):
     loss_sum = 0.0
     samples = 0
     steps = 0
+    correct_tokens = 0
+    total_tokens = 0
+    codebook_correct = None
+    codebook_total = None
     for batch in dataloader:
         if args.eval_max_batches is not None and steps >= args.eval_max_batches:
             break
@@ -251,10 +266,22 @@ def evaluate(model, dataloader, text_tokenizer, config, args, device):
             prompt_speech_token=input_ids,
             speaker_emb=speaker_embeddings,
             labels=labels,
-            return_logits=False,
+            return_logits=True,
         )
         batch_size = int(input_ids.shape[0])
         loss_sum += float(outputs["loss"].detach().cpu().item()) * batch_size
+        batch_correct, batch_total, batch_codebook_correct, batch_codebook_total = _accuracy_counts(
+            outputs["logits"],
+            outputs["shifted_labels"],
+        )
+        correct_tokens += batch_correct
+        total_tokens += batch_total
+        if codebook_correct is None:
+            codebook_correct = batch_codebook_correct
+            codebook_total = batch_codebook_total
+        else:
+            codebook_correct += batch_codebook_correct
+            codebook_total += batch_codebook_total
         samples += batch_size
         steps += 1
 
@@ -263,12 +290,20 @@ def evaluate(model, dataloader, text_tokenizer, config, args, device):
         model.train()
         if args.freeze_llm:
             model.llm.eval()
-    return {
+    metrics = {
         "eval_loss": _format_metric(loss_sum / max(samples, 1)),
+        "eval_masked_token_accuracy": _format_metric(correct_tokens / max(total_tokens, 1)),
+        "eval_target_tokens": str(total_tokens),
         "eval_runtime": _format_metric(runtime),
         "eval_samples_per_second": _format_metric(samples / runtime if runtime > 0 else 0.0),
         "eval_steps_per_second": _format_metric(steps / runtime if runtime > 0 else 0.0),
     }
+    if codebook_correct is not None and codebook_total is not None:
+        for codebook_idx, (correct, total) in enumerate(zip(codebook_correct, codebook_total)):
+            metrics[f"eval_codebook_{codebook_idx}_accuracy"] = _format_metric(
+                int(correct.item()) / max(int(total.item()), 1)
+            )
+    return metrics
 
 
 def encode_texts(text_tokenizer, texts: Sequence[str], language: str, pad_token_id: int):
@@ -314,6 +349,20 @@ def _to_float(value) -> float:
     return float(value)
 
 
+def _accuracy_counts(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = -100):
+    predictions = logits.argmax(dim=-1)
+    mask = labels.ne(ignore_index)
+    correct = predictions.eq(labels) & mask
+    codebook_correct = correct.sum(dim=(0, 2)).detach().cpu()
+    codebook_total = mask.sum(dim=(0, 2)).detach().cpu()
+    return (
+        int(correct.sum().item()),
+        int(mask.sum().item()),
+        codebook_correct,
+        codebook_total,
+    )
+
+
 def _format_metric(value: float) -> str:
     value = float(value)
     if value == 0.0:
@@ -321,6 +370,26 @@ def _format_metric(value: float) -> str:
     if abs(value) < 1e-4 or abs(value) >= 1e4:
         return f"{value:.4g}"
     return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _progress_metrics(start_time: float, step: int, max_steps: int) -> dict[str, str]:
+    elapsed = max(time.perf_counter() - start_time, 0.0)
+    steps_per_second = step / elapsed if elapsed > 0 else 0.0
+    remaining_steps = max(max_steps - step, 0)
+    eta_seconds = remaining_steps / steps_per_second if steps_per_second > 0 else 0.0
+    return {
+        "elapsed": _format_duration(elapsed),
+        "eta": _format_duration(eta_seconds),
+        # "remaining_steps": str(remaining_steps),
+        # "steps_per_second": _format_metric(steps_per_second),
+    }
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(int(seconds), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def _resolve_device(device: str) -> torch.device:
